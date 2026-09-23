@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { Login } from './pages/Login';
 import { InspectionForm } from './pages/InspectionForm';
+import { Dashboard } from './pages/Dashboard';
 
 const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { isAuthenticated, isLoading } = useAuth();
@@ -29,6 +30,14 @@ export function App() {
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route
+            path="/dashboard"
+            element={
+              <ProtectedRoute>
+                <Dashboard />
+              </ProtectedRoute>
+            }
+          />
+          <Route
             path="/form"
             element={
               <ProtectedRoute>
@@ -36,8 +45,8 @@ export function App() {
               </ProtectedRoute>
             }
           />
-          <Route path="/" element={<Navigate to="/form" replace />} />
-          <Route path="*" element={<Navigate to="/form" replace />} />
+          <Route path="/" element={<Navigate to="/dashboard" replace />} />
+          <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>
       </BrowserRouter>
     </AuthProvider>

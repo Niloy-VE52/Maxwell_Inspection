@@ -54,9 +54,36 @@ export const Navbar: React.FC<NavbarProps> = ({ onResetForm }) => {
                 MAXWELL
               </div>
               <div className="text-[10px] font-medium uppercase tracking-widest text-slate-500">
-                PM Inspection Checklist
+                Room Preventive Maintenance
               </div>
             </div>
+          </div>
+
+          {/* Center Navigation Tabs */}
+          <div className="hidden md:flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => navigate('/dashboard')}
+              className={`px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
+                window.location.pathname.includes('/dashboard')
+                  ? 'bg-slate-900 text-white shadow-sm'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+              }`}
+            >
+              <span>Dashboard</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate('/form')}
+              className={`px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
+                window.location.pathname.includes('/form')
+                  ? 'bg-slate-900 text-white shadow-sm'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+              }`}
+            >
+              <ClipboardCheck className="w-3.5 h-3.5" />
+              <span>Inspection Form</span>
+            </button>
           </div>
 
           {/* User & Actions */}

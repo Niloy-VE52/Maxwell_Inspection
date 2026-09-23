@@ -2,34 +2,49 @@ import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import type { Section, InspectionItem } from '../types';
 
-interface GeneratePdfOptions {
+export interface GeneratePdfOptions {
   roomNumber: string;
   roomType: string;
   inspectionDate: string;
+  quarter?: string;
   status: string;
   sections: Section[];
   itemsMap: Record<number, InspectionItem>;
   overallRemark: string;
-  inspectorName: string;
+  maintenanceCarriedBy?: string;
   signatureUrl: string | null;
+  inspectedByName?: string;
+  inspectedBySignatureUrl?: string | null;
+  inspectedAt?: string;
+  // Backward compatibility alias
+  inspectorName?: string;
   verifiedByName?: string;
   verifiedAt?: string;
 }
 
-export function generateInspectionPdf(options: GeneratePdfOptions): void {
+export function buildInspectionPdfDoc(options: GeneratePdfOptions): { doc: jsPDF; filename: string } {
   const {
     roomNumber,
     roomType,
     inspectionDate,
+    quarter,
     status,
     sections,
     itemsMap,
     overallRemark,
+    maintenanceCarriedBy,
     inspectorName,
     signatureUrl,
-    verifiedByName = 'Verified by Supervisor',
+    inspectedByName,
+    inspectedBySignatureUrl,
+    inspectedAt,
+    verifiedByName,
     verifiedAt,
   } = options;
+
+  const maintenancePerson = maintenanceCarriedBy || inspectorName || 'Maintenance Staff';
+  const inspectorPerson = inspectedByName || verifiedByName || 'Not Specified';
+  const officialInspectDate = inspectedAt || verifiedAt || inspectionDate;
 
   // Initialize A4 portrait document (210mm x 297mm)
   const doc = new jsPDF({
@@ -52,16 +67,16 @@ export function generateInspectionPdf(options: GeneratePdfOptions): void {
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(14);
   doc.setTextColor(251, 191, 36); // amber-400
-  doc.text('THE MAXWELL - INSPECTION LIST', pageWidth / 2, currentY + 7.5, { align: 'center' });
+  doc.text('THE MAXWELL - ROOM PREVENTIVE MAINTENANCE', pageWidth / 2, currentY + 7.5, { align: 'center' });
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(8);
   doc.setTextColor(226, 232, 240); // slate-200
-  doc.text('PREVENTIVE MAINTENANCE INSPECTION REPORT', pageWidth / 2, currentY + 13, { align: 'center' });
+  doc.text('ROOM PREVENTIVE MAINTENANCE INSPECTION REPORT', pageWidth / 2, currentY + 13, { align: 'center' });
 
   currentY += 22;
 
-  // Metadata Table (Type, Room, Date, Status)
+  // Metadata Table (Type, Room, Date, Quarter, Status)
   autoTable(doc, {
     startY: currentY,
     margin: { left: margin, right: margin },
@@ -77,14 +92,8 @@ export function generateInspectionPdf(options: GeneratePdfOptions): void {
       [
         { content: 'Inspection Date:', styles: { fontStyle: 'bold', fillColor: [241, 245, 249], textColor: [51, 65, 85] } },
         { content: inspectionDate || new Date().toLocaleDateString(), styles: { textColor: [15, 23, 42] } },
-        { content: 'Status:', styles: { fontStyle: 'bold', fillColor: [241, 245, 249], textColor: [51, 65, 85] } },
-        {
-          content: status.toUpperCase(),
-          styles: {
-            fontStyle: 'bold',
-            textColor: status === 'submitted' || status === 'verified' ? [22, 101, 52] : [180, 83, 9],
-          },
-        },
+        { content: 'Schedule Quarter:', styles: { fontStyle: 'bold', fillColor: [241, 245, 249], textColor: [51, 65, 85] } },
+        { content: `${quarter || '2nd Quarter (May - August)'} (${status.toUpperCase()})`, styles: { fontStyle: 'bold', textColor: [15, 23, 42] } },
       ],
     ],
     styles: {
@@ -103,39 +112,88 @@ export function generateInspectionPdf(options: GeneratePdfOptions): void {
 
   currentY = (doc as any).lastAutoTable.finalY + 4;
 
-  // Checklist Sections A to K
+  // Summary Metrics Bar
+  let totalItems = 0;
+  let passCount = 0;
+  let failCount = 0;
+  let naCount = 0;
+
+  sections.forEach((sec) => {
+    sec.items.forEach((item) => {
+      totalItems++;
+      const res = itemsMap[item.id]?.result;
+      if (res === 'pass') passCount++;
+      else if (res === 'fail') failCount++;
+      else if (res === 'na') naCount++;
+    });
+  });
+
+  const answeredCount = passCount + failCount + naCount;
+  const passRate = answeredCount > 0 ? Math.round((passCount / (passCount + failCount || 1)) * 100) : 0;
+
+  autoTable(doc, {
+    startY: currentY,
+    margin: { left: margin, right: margin },
+    theme: 'plain',
+    body: [
+      [
+        {
+          content: `Total Items: ${totalItems}   |   Checked: ${answeredCount}   |   Pass: ${passCount}   |   Defects/Fail: ${failCount}   |   Pass Rate: ${passRate}%`,
+          styles: {
+            fillColor: [248, 250, 252],
+            textColor: failCount > 0 ? [185, 28, 28] : [22, 101, 52],
+            fontStyle: 'bold',
+            fontSize: 8,
+            halign: 'center',
+            cellPadding: 2,
+            lineColor: [226, 232, 240],
+            lineWidth: 0.2,
+          },
+        },
+      ],
+    ],
+  });
+
+  currentY = (doc as any).lastAutoTable.finalY + 4;
+
+  // Render Checklist Sections
   sections.forEach((section) => {
-    // Check if section requires a page break if too close to bottom
+    const tableBody: any[][] = [];
+
+    section.items.forEach((item) => {
+      const itemRecord = itemsMap[item.id];
+      const result = itemRecord?.result;
+      const remark = itemRecord?.remark || '';
+
+      let statusText = '—';
+      let statusStyle: any = { textColor: [148, 163, 184], fontStyle: 'normal', halign: 'center' };
+
+      if (result === 'pass') {
+        statusText = 'PASS';
+        statusStyle = { textColor: [22, 101, 52], fontStyle: 'bold', halign: 'center', fillColor: [240, 253, 244] };
+      } else if (result === 'fail') {
+        statusText = 'DEFECT';
+        statusStyle = { textColor: [185, 28, 28], fontStyle: 'bold', halign: 'center', fillColor: [254, 242, 242] };
+      } else if (result === 'na') {
+        statusText = 'N/A';
+        statusStyle = { textColor: [100, 116, 139], fontStyle: 'normal', halign: 'center', fillColor: [248, 250, 252] };
+      }
+
+      tableBody.push([
+        { content: item.item_no, styles: { halign: 'center', fontStyle: 'bold', textColor: [71, 85, 105] } },
+        { content: item.description, styles: { textColor: [15, 23, 42] } },
+        { content: statusText, styles: statusStyle },
+        {
+          content: remark,
+          styles: { textColor: result === 'fail' ? [185, 28, 28] : [71, 85, 105], fontStyle: result === 'fail' ? 'bold' : 'normal' },
+        },
+      ]);
+    });
+
     if (currentY > pageHeight - 35) {
       doc.addPage();
       currentY = margin;
     }
-
-    const tableRows = section.items.map((item) => {
-      const ans = itemsMap[item.id];
-      let resultText = '-';
-      let resultStyle: { textColor: [number, number, number]; fontStyle?: 'bold' | 'normal' } = {
-        textColor: [148, 163, 184],
-      };
-
-      if (ans?.result === 'pass') {
-        resultText = 'PASS';
-        resultStyle = { textColor: [22, 101, 52], fontStyle: 'bold' };
-      } else if (ans?.result === 'fail') {
-        resultText = 'FAIL';
-        resultStyle = { textColor: [185, 28, 28], fontStyle: 'bold' };
-      } else if (ans?.result === 'na') {
-        resultText = 'N/A';
-        resultStyle = { textColor: [100, 116, 139] };
-      }
-
-      return [
-        { content: String(item.item_no), styles: { halign: 'center', textColor: [71, 85, 105] } },
-        { content: item.description, styles: { textColor: [15, 23, 42] } },
-        { content: resultText, styles: { halign: 'center', ...resultStyle } },
-        { content: ans?.remark || '', styles: { textColor: ans?.result === 'fail' ? [185, 28, 28] : [71, 85, 105] } },
-      ];
-    });
 
     autoTable(doc, {
       startY: currentY,
@@ -147,7 +205,7 @@ export function generateInspectionPdf(options: GeneratePdfOptions): void {
             content: `${section.code}. ${section.title}`,
             colSpan: 4,
             styles: {
-              fillColor: [30, 41, 59],
+              fillColor: [30, 41, 59], // slate-800
               textColor: [255, 255, 255],
               fontStyle: 'bold',
               fontSize: 8.5,
@@ -156,30 +214,25 @@ export function generateInspectionPdf(options: GeneratePdfOptions): void {
           },
         ],
         [
-          { content: '#', styles: { halign: 'center', cellWidth: 10 } },
-          { content: 'Checklist Item', styles: { cellWidth: 105 } },
-          { content: 'Result', styles: { halign: 'center', cellWidth: 20 } },
-          { content: 'Remarks / Defect Details', styles: { cellWidth: 51 } },
+          { content: '#', styles: { fillColor: [241, 245, 249], fontStyle: 'bold', halign: 'center', textColor: [51, 65, 85] } },
+          { content: 'Checklist Item', styles: { fillColor: [241, 245, 249], fontStyle: 'bold', textColor: [51, 65, 85] } },
+          { content: 'Result', styles: { fillColor: [241, 245, 249], fontStyle: 'bold', halign: 'center', textColor: [51, 65, 85] } },
+          { content: 'Remarks / Defect Details', styles: { fillColor: [241, 245, 249], fontStyle: 'bold', textColor: [51, 65, 85] } },
         ],
       ],
-      body: tableRows as any,
+      body: tableBody,
       styles: {
         fontSize: 7.5,
         cellPadding: 1.8,
         lineColor: [226, 232, 240],
         lineWidth: 0.15,
-        valign: 'middle',
+        overflow: 'linebreak',
       },
-      headStyles: {
-        fillColor: [241, 245, 249],
-        textColor: [51, 65, 85],
-        fontStyle: 'bold',
-        fontSize: 7.5,
-        lineColor: [203, 213, 225],
-        lineWidth: 0.2,
-      },
-      alternateRowStyles: {
-        fillColor: [248, 250, 252],
+      columnStyles: {
+        0: { cellWidth: 10 },
+        1: { cellWidth: 95 },
+        2: { cellWidth: 20 },
+        3: { cellWidth: 61 },
       },
       pageBreak: 'auto',
     });
@@ -187,53 +240,43 @@ export function generateInspectionPdf(options: GeneratePdfOptions): void {
     currentY = (doc as any).lastAutoTable.finalY + 3;
   });
 
-  // Overall remarks if present
-  if (overallRemark && overallRemark.trim().length > 0) {
-    if (currentY > pageHeight - 45) {
-      doc.addPage();
-      currentY = margin;
-    }
-
-    autoTable(doc, {
-      startY: currentY,
-      margin: { left: margin, right: margin },
-      theme: 'grid',
-      head: [
-        [
-          {
-            content: 'OVERALL REMARKS & MAINTENANCE NOTES',
-            styles: {
-              fillColor: [241, 245, 249],
-              textColor: [15, 23, 42],
-              fontStyle: 'bold',
-              fontSize: 8,
-            },
-          },
-        ],
-      ],
-      body: [
-        [
-          {
-            content: overallRemark,
-            styles: {
-              fontSize: 8,
-              cellPadding: 3,
-              textColor: [30, 41, 59],
-            },
-          },
-        ],
-      ],
-    });
-
-    currentY = (doc as any).lastAutoTable.finalY + 4;
-  }
-
-  // Footer Signatures Box
-  if (currentY > pageHeight - 40) {
+  // Overall Remarks Section
+  if (currentY > pageHeight - 65) {
     doc.addPage();
     currentY = margin;
   }
 
+  autoTable(doc, {
+    startY: currentY,
+    margin: { left: margin, right: margin },
+    theme: 'grid',
+    head: [
+      [
+        {
+          content: 'Overall Remarks & Observations',
+          styles: { fillColor: [241, 245, 249], textColor: [51, 65, 85], fontStyle: 'bold', fontSize: 8.5 },
+        },
+      ],
+    ],
+    body: [
+      [
+        {
+          content: overallRemark || 'No additional remarks recorded.',
+          styles: { minCellHeight: 12, fontSize: 8, textColor: [30, 41, 59] },
+        },
+      ],
+    ],
+    styles: { lineColor: [203, 213, 225], lineWidth: 0.2 },
+  });
+
+  currentY = (doc as any).lastAutoTable.finalY + 4;
+
+  if (currentY > pageHeight - 50) {
+    doc.addPage();
+    currentY = margin;
+  }
+
+  // Signatures Table: Date / Maintenance carried By / Inspected By
   const signTableStartY = currentY;
 
   autoTable(doc, {
@@ -242,24 +285,24 @@ export function generateInspectionPdf(options: GeneratePdfOptions): void {
     theme: 'grid',
     head: [
       [
-        { content: 'Date', styles: { fontStyle: 'bold', fillColor: [241, 245, 249], textColor: [51, 65, 85] } },
-        { content: 'Inspected By', styles: { fontStyle: 'bold', fillColor: [241, 245, 249], textColor: [51, 65, 85] } },
-        { content: 'Verified By', styles: { fontStyle: 'bold', fillColor: [241, 245, 249], textColor: [51, 65, 85] } },
+        { content: 'Date & Schedule', styles: { fontStyle: 'bold', fillColor: [241, 245, 249], textColor: [51, 65, 85] } },
+        { content: 'Maintenance carried By (Mandatory)', styles: { fontStyle: 'bold', fillColor: [241, 245, 249], textColor: [51, 65, 85] } },
+        { content: 'Inspected By (Optional)', styles: { fontStyle: 'bold', fillColor: [241, 245, 249], textColor: [51, 65, 85] } },
       ],
     ],
     body: [
       [
         {
-          content: `${inspectionDate}\n\nOfficial Submission Record`,
-          styles: { minCellHeight: 22, fontSize: 8, textColor: [30, 41, 59] },
+          content: `${inspectionDate}\n${quarter || ''}\nOfficial Submission Record`,
+          styles: { minCellHeight: 28, fontSize: 8, textColor: [30, 41, 59], cellPadding: 3 },
         },
         {
-          content: signatureUrl ? `\n\n\n${inspectorName}` : `\n\n${inspectorName}\n(Digital Sign-off)`,
-          styles: { minCellHeight: 22, fontSize: 8, textColor: [30, 41, 59] },
+          content: '', // Dynamically rendered via didDrawCell
+          styles: { minCellHeight: 28, cellPadding: 3 },
         },
         {
-          content: `${verifiedByName}\n${verifiedAt || inspectionDate}\nEngineering Supervisor`,
-          styles: { minCellHeight: 22, fontSize: 8, textColor: [30, 41, 59] },
+          content: '', // Dynamically rendered via didDrawCell
+          styles: { minCellHeight: 28, cellPadding: 3 },
         },
       ],
     ],
@@ -272,22 +315,76 @@ export function generateInspectionPdf(options: GeneratePdfOptions): void {
       1: { cellWidth: 76 },
       2: { cellWidth: 55 },
     },
+    didDrawCell: (data) => {
+      if (data.section === 'body') {
+        const cell = data.cell;
+        if (data.column.index === 1) {
+          // Maintenance carried By
+          let drawY = cell.y + 2.5;
+          const hasSig = signatureUrl && (signatureUrl.startsWith('data:image') || signatureUrl.startsWith('blob:'));
+
+          if (hasSig) {
+            try {
+              const imgWidth = 38;
+              const imgHeight = 11;
+              const imgX = cell.x + 3;
+              doc.addImage(signatureUrl, 'PNG', imgX, drawY, imgWidth, imgHeight);
+              drawY += imgHeight + 2.5;
+            } catch (e) {
+              console.warn('Could not embed maintenance signature image in PDF', e);
+            }
+          } else {
+            drawY += 3;
+          }
+
+          doc.setFontSize(8);
+          doc.setFont('helvetica', 'bold');
+          doc.setTextColor(30, 41, 59);
+          doc.text(maintenancePerson || 'Not Specified', cell.x + 3, drawY + 2.5);
+
+          if (!hasSig) {
+            doc.setFontSize(7.5);
+            doc.setFont('helvetica', 'normal');
+            doc.setTextColor(100, 116, 139);
+            doc.text('(Digital Sign-off)', cell.x + 3, drawY + 6.5);
+          }
+        } else if (data.column.index === 2) {
+          // Inspected By
+          let drawY = cell.y + 2.5;
+          const hasSig = inspectedBySignatureUrl && (inspectedBySignatureUrl.startsWith('data:image') || inspectedBySignatureUrl.startsWith('blob:'));
+
+          if (hasSig) {
+            try {
+              const imgWidth = 35;
+              const imgHeight = 11;
+              const imgX = cell.x + 3;
+              doc.addImage(inspectedBySignatureUrl, 'PNG', imgX, drawY, imgWidth, imgHeight);
+              drawY += imgHeight + 2.5;
+            } catch (e) {
+              console.warn('Could not embed inspected-by signature image in PDF', e);
+            }
+          } else {
+            drawY += 3;
+          }
+
+          doc.setFontSize(8);
+          doc.setFont('helvetica', 'bold');
+          doc.setTextColor(30, 41, 59);
+          doc.text(inspectorPerson || 'Not Specified', cell.x + 3, drawY + 2.5);
+
+          doc.setFontSize(7);
+          doc.setFont('helvetica', 'normal');
+          doc.setTextColor(100, 116, 139);
+          if (hasSig) {
+            doc.text(`${officialInspectDate} • Verified`, cell.x + 3, drawY + 6.5);
+          } else {
+            doc.text(officialInspectDate, cell.x + 3, drawY + 6.5);
+            doc.text('Official Inspection Sign-off', cell.x + 3, drawY + 10);
+          }
+        }
+      }
+    },
   });
-
-  // If signature image is present (base64 or data url), draw it in the middle cell
-  if (signatureUrl && (signatureUrl.startsWith('data:image') || signatureUrl.startsWith('blob:'))) {
-    try {
-      const cellTop = signTableStartY + 7; // after header row
-      const imgX = margin + 55 + 5;
-      const imgY = cellTop + 1;
-      const imgWidth = 40;
-      const imgHeight = 12;
-
-      doc.addImage(signatureUrl, 'PNG', imgX, imgY, imgWidth, imgHeight);
-    } catch (e) {
-      console.warn('Could not embed signature image in PDF', e);
-    }
-  }
 
   // Add Page Numbers & Footers
   const totalPages = doc.getNumberOfPages();
@@ -296,14 +393,24 @@ export function generateInspectionPdf(options: GeneratePdfOptions): void {
     doc.setFontSize(7);
     doc.setTextColor(148, 163, 184); // slate-400
     doc.text(
-      `Maxwell Hotel & Suites • Preventive Maintenance Inspection • Room ${roomNumber}`,
+      `Maxwell Hotel & Suites • Room Preventive Maintenance Inspection • Room ${roomNumber}`,
       margin,
       pageHeight - 6
     );
     doc.text(`Page ${i} of ${totalPages}`, pageWidth - margin, pageHeight - 6, { align: 'right' });
   }
 
-  // Download PDF
   const safeFilename = `Maxwell_Inspection_Room_${roomNumber.replace(/[^a-zA-Z0-9]/g, '_')}_${new Date().toISOString().slice(0, 10)}.pdf`;
-  doc.save(safeFilename);
+  return { doc, filename: safeFilename };
+}
+
+export function generateInspectionPdf(options: GeneratePdfOptions): void {
+  const { doc, filename } = buildInspectionPdfDoc(options);
+  doc.save(filename);
+}
+
+export function getInspectionPdfBlob(options: GeneratePdfOptions): { blob: Blob; filename: string } {
+  const { doc, filename } = buildInspectionPdfDoc(options);
+  const blob = doc.output('blob');
+  return { blob, filename };
 }

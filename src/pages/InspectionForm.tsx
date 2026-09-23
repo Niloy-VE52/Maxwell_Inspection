@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { useSearchParams, useNavigate } from 'react-router-dom';
 import type { Section, InspectionItemResult, InspectionItem } from '../types';
 import { MAXWELL_SECTIONS, QUICK_DEFECT_TAGS } from '../data/templateData';
-import { generateInspectionPdf } from '../services/pdfGenerator';
+import { generateInspectionPdf, getInspectionPdfBlob } from '../services/pdfGenerator';
 import { useAuth } from '../context/AuthContext';
 import { Navbar } from '../components/Navbar';
 import { SignatureSelector } from '../components/SignatureSelector';
+import { api } from '../services/api';
 import confetti from 'canvas-confetti';
 import {
   Check,
@@ -13,27 +15,90 @@ import {
   Printer,
   CheckCircle2,
   Cloud,
+  UploadCloud,
   RefreshCw,
   Send,
   Sparkles,
   Edit3,
+  AlertTriangle,
+  ExternalLink,
+  FolderCheck,
 } from 'lucide-react';
 
 const STORAGE_KEY = 'maxwell_active_inspection';
 
+const getTodayDateString = () => {
+  const d = new Date();
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const formatDisplayDate = (dateStr: string) => {
+  if (!dateStr) return '';
+  const parts = dateStr.split('-');
+  if (parts.length === 3) {
+    const year = parseInt(parts[0], 10);
+    const month = parseInt(parts[1], 10) - 1;
+    const day = parseInt(parts[2], 10);
+    const dateObj = new Date(year, month, day);
+    if (!isNaN(dateObj.getTime())) {
+      return dateObj.toLocaleDateString('en-GB', {
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric',
+      });
+    }
+  }
+  return dateStr;
+};
+
 export const InspectionForm: React.FC = () => {
   const { user } = useAuth();
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
 
   // Sections
   const sections: Section[] = MAXWELL_SECTIONS;
 
-  // Header State
-  const [roomNumber, setRoomNumber] = useState<string>('101');
-  const [roomType, setRoomType] = useState<string>('Deluxe');
+  // URL Query param overrides
+  const urlRoom = searchParams.get('room');
+  const urlType = searchParams.get('type');
+
+  // Header & Sign-off State
+  const [roomNumber, setRoomNumber] = useState<string>(urlRoom || '101');
+  const [roomType, setRoomType] = useState<string>(urlType || 'Deluxe');
+  const [selectedDate, setSelectedDate] = useState<string>(getTodayDateString());
+  const [selectedQuarter, setSelectedQuarter] = useState<string>('2nd Quarter (May - August)');
+
+  // Sign-off names & signatures
+  const [maintenanceCarriedBy, setMaintenanceCarriedBy] = useState<string>(
+    user?.role === 'inspector' || !user?.role ? user?.full_name || 'John Tan' : 'John Tan'
+  );
+  const [maintenanceSignatureUrl, setMaintenanceSignatureUrl] = useState<string | null>(null);
+
+  const [inspectedBy, setInspectedBy] = useState<string>(
+    user?.role === 'supervisor' ? user.full_name : ''
+  );
+  const [inspectedBySignatureUrl, setInspectedBySignatureUrl] = useState<string | null>(null);
+
   const [overallRemark, setOverallRemark] = useState<string>('');
-  const [selectedSignatureUrl, setSelectedSignatureUrl] = useState<string | null>(null);
   const [isSubmitted, setIsSubmitted] = useState<boolean>(false);
   const [submittedAt, setSubmittedAt] = useState<string | null>(null);
+
+  // Validation / Duplicate warning alert state
+  const [duplicateAlert, setDuplicateAlert] = useState<string | null>(null);
+  const [isCheckingDuplicate, setIsCheckingDuplicate] = useState<boolean>(false);
+
+  // Dropbox Upload State
+  const [isSavingDropbox, setIsSavingDropbox] = useState<boolean>(false);
+  const [dropboxStatus, setDropboxStatus] = useState<{
+    success: boolean;
+    message: string;
+    path?: string;
+    share_url?: string;
+  } | null>(null);
 
   // Items State (checklist_item_id -> InspectionItem)
   const [itemsMap, setItemsMap] = useState<Record<number, InspectionItem>>({});
@@ -49,10 +114,17 @@ export const InspectionForm: React.FC = () => {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
         const data = JSON.parse(saved);
-        if (data.roomNumber) setRoomNumber(data.roomNumber);
-        if (data.roomType) setRoomType(data.roomType);
+        if (data.roomNumber && !urlRoom) setRoomNumber(data.roomNumber);
+        if (data.roomType && !urlType) setRoomType(data.roomType);
+        if (data.selectedDate) setSelectedDate(data.selectedDate);
+        if (data.selectedQuarter) setSelectedQuarter(data.selectedQuarter);
+        if (data.maintenanceCarriedBy) setMaintenanceCarriedBy(data.maintenanceCarriedBy);
+        if (data.maintenanceSignatureUrl || data.selectedSignatureUrl) {
+          setMaintenanceSignatureUrl(data.maintenanceSignatureUrl || data.selectedSignatureUrl);
+        }
+        if (data.inspectedBy) setInspectedBy(data.inspectedBy);
+        if (data.inspectedBySignatureUrl) setInspectedBySignatureUrl(data.inspectedBySignatureUrl);
         if (data.overallRemark) setOverallRemark(data.overallRemark);
-        if (data.selectedSignatureUrl) setSelectedSignatureUrl(data.selectedSignatureUrl);
         if (data.itemsMap) setItemsMap(data.itemsMap);
         if (data.isSubmitted) setIsSubmitted(data.isSubmitted);
         if (data.submittedAt) setSubmittedAt(data.submittedAt);
@@ -60,14 +132,19 @@ export const InspectionForm: React.FC = () => {
     } catch (e) {
       console.warn('Error loading inspection from storage', e);
     }
-  }, []);
+  }, [urlRoom, urlType]);
 
   // Save to localStorage
   const saveInspectionState = (override?: Partial<{
     roomNumber: string;
     roomType: string;
+    selectedDate: string;
+    selectedQuarter: string;
+    maintenanceCarriedBy: string;
+    maintenanceSignatureUrl: string | null;
+    inspectedBy: string;
+    inspectedBySignatureUrl: string | null;
     overallRemark: string;
-    selectedSignatureUrl: string | null;
     itemsMap: Record<number, InspectionItem>;
     isSubmitted: boolean;
     submittedAt: string | null;
@@ -76,8 +153,13 @@ export const InspectionForm: React.FC = () => {
     const stateToSave = {
       roomNumber,
       roomType,
+      selectedDate,
+      selectedQuarter,
+      maintenanceCarriedBy,
+      maintenanceSignatureUrl,
+      inspectedBy,
+      inspectedBySignatureUrl,
       overallRemark,
-      selectedSignatureUrl,
       itemsMap,
       isSubmitted,
       submittedAt,
@@ -132,19 +214,18 @@ export const InspectionForm: React.FC = () => {
     });
   };
 
-  // Shortcut: Mark entire section items as PASS
+  // Quick Pass all items in a section
   const handlePassSection = (section: Section) => {
     setItemsMap((prev) => {
       const newMap = { ...prev };
       section.items.forEach((item) => {
-        const existing = newMap[item.id];
-        if (!existing || !existing.result) {
+        if (!newMap[item.id] || !newMap[item.id].result) {
           newMap[item.id] = {
             id: item.id,
             inspection_id: 1,
             checklist_item_id: item.id,
             result: 'pass',
-            remark: existing?.remark || null,
+            remark: null,
             photo_url: null,
           };
         }
@@ -152,12 +233,6 @@ export const InspectionForm: React.FC = () => {
       saveInspectionState({ itemsMap: newMap });
       return newMap;
     });
-  };
-
-  // Handle Signature Selection
-  const handleSelectSignature = (sigUrl: string | null) => {
-    setSelectedSignatureUrl(sigUrl);
-    saveInspectionState({ selectedSignatureUrl: sigUrl });
   };
 
   // Reset / Clear Form for new room
@@ -169,22 +244,82 @@ export const InspectionForm: React.FC = () => {
     ) {
       setItemsMap({});
       setOverallRemark('');
+      setSelectedDate(getTodayDateString());
       setIsSubmitted(false);
       setSubmittedAt(null);
+      setDuplicateAlert(null);
       localStorage.removeItem(STORAGE_KEY);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
   };
 
-  // Submit Inspection
-  const handleSubmit = () => {
-    if (!selectedSignatureUrl) {
-      alert('Please select or upload/draw your inspector signature before submitting.');
+  // Check duplicate inspection in this quarter before submitting
+  const checkAlreadyInspectedThisQuarter = async (room: string, quarter: string, date: string): Promise<boolean> => {
+    try {
+      const year = parseInt(date.split('-')[0], 10) || 2026;
+      const records = await api.getRpmRecords({ year, quarter });
+      
+      if (!records || records.length === 0) return false;
+
+      const cleanTarget = room.toLowerCase().replace(/room\s*/i, '').trim();
+
+      const matched = records.find((r) => {
+        const rClean = r.room_or_area.toLowerCase().replace(/room\s*/i, '').trim();
+        return rClean === cleanTarget || r.room_or_area.toLowerCase() === room.toLowerCase().trim();
+      });
+
+      if (matched && matched.inspection_status === 'Done') {
+        return true;
+      }
+    } catch (e) {
+      console.warn('Duplicate check offline or backend sync fallback', e);
+    }
+    return false;
+  };
+
+  // Submit Inspection with Mandatory Validations & Duplicate Check
+  const handleSubmit = async () => {
+    setDuplicateAlert(null);
+
+    // 1. Mandatory Validations
+    if (!selectedDate) {
+      alert('⚠️ Mandatory Field Missing: Please select an Inspection Date.');
+      document.getElementById('manual-date-input')?.focus();
+      return;
+    }
+
+    if (!selectedQuarter) {
+      alert('⚠️ Mandatory Field Missing: Please select the Inspection Quarter.');
+      document.getElementById('quarter-select-input')?.focus();
+      return;
+    }
+
+    if (!maintenanceCarriedBy.trim()) {
+      alert('⚠️ Mandatory Field Missing: Please enter the name under "Maintenance carried By".');
+      document.getElementById('maintenance-carried-by-input')?.focus();
+      return;
+    }
+
+    if (!maintenanceSignatureUrl) {
+      alert('⚠️ Mandatory Field Missing: Maintenance Signature is required. Please upload or select a signature image under "Maintenance carried By".');
       const footerEl = document.getElementById('form-footer');
       if (footerEl) footerEl.scrollIntoView({ behavior: 'smooth' });
       return;
     }
 
+    // 2. Duplicate Inspection Check: Don't let it submit if room is inspected this quarter!
+    setIsCheckingDuplicate(true);
+    const isDuplicate = await checkAlreadyInspectedThisQuarter(roomNumber, selectedQuarter, selectedDate);
+    setIsCheckingDuplicate(false);
+
+    if (isDuplicate) {
+      const msg = `Room ${roomNumber} has ALREADY been inspected for ${selectedQuarter}. Duplicate inspection submissions for the same quarter are blocked.`;
+      setDuplicateAlert(msg);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
+
+    // 3. Complete Submission
     const nowStr = new Date().toLocaleDateString('en-GB', {
       day: '2-digit',
       month: 'short',
@@ -197,6 +332,45 @@ export const InspectionForm: React.FC = () => {
     setSubmittedAt(nowStr);
     saveInspectionState({ isSubmitted: true, submittedAt: nowStr });
 
+    // Sync inspection report to FastAPI backend
+    api.submitInspection({
+      room_number: roomNumber,
+      room_type: roomType,
+      inspection_date: formatDisplayDate(selectedDate),
+      status: 'submitted',
+      maintenance_carried_by: maintenanceCarriedBy,
+      inspected_by: inspectedBy || undefined,
+      signature_url: maintenanceSignatureUrl,
+      overall_remark: overallRemark,
+      items: Object.values(itemsMap).map((it) => ({
+        checklist_item_id: it.checklist_item_id,
+        result: it.result || 'PASS',
+        remark: it.remark,
+      })),
+    }).catch((err) => {
+      console.warn('Backend inspection sync note:', err);
+    });
+
+    // Also update RPM record in schedule table to Done
+    try {
+      const year = parseInt(selectedDate.split('-')[0], 10) || 2026;
+      const records = await api.getRpmRecords({ year, quarter: selectedQuarter });
+      const cleanTarget = roomNumber.toLowerCase().replace(/room\s*/i, '').trim();
+      const matched = records?.find((r) => {
+        const rClean = r.room_or_area.toLowerCase().replace(/room\s*/i, '').trim();
+        return rClean === cleanTarget || r.room_or_area.toLowerCase() === roomNumber.toLowerCase().trim();
+      });
+
+      if (matched) {
+        await api.updateRpmRecord(matched.id, {
+          inspection_status: 'Done',
+          eng_date: selectedDate,
+        });
+      }
+    } catch (e) {
+      console.warn('RPM schedule update sync note', e);
+    }
+
     try {
       confetti({
         particleCount: 120,
@@ -205,7 +379,6 @@ export const InspectionForm: React.FC = () => {
       });
     } catch (e) { }
 
-    // Scroll to action area
     const actionsEl = document.getElementById('submission-actions');
     if (actionsEl) {
       actionsEl.scrollIntoView({ behavior: 'smooth' });
@@ -214,25 +387,68 @@ export const InspectionForm: React.FC = () => {
 
   // Download PDF
   const handleDownloadPdf = () => {
-    const formattedDate = submittedAt || new Date().toLocaleDateString('en-GB', {
-      day: '2-digit',
-      month: 'short',
-      year: 'numeric',
-    });
+    const formattedDate = formatDisplayDate(selectedDate);
 
     generateInspectionPdf({
       roomNumber,
       roomType,
       inspectionDate: formattedDate,
+      quarter: selectedQuarter,
       status: isSubmitted ? 'submitted' : 'in_progress',
       sections,
       itemsMap,
       overallRemark,
-      inspectorName: user?.full_name || 'Inspector John Tan',
-      signatureUrl: selectedSignatureUrl,
-      verifiedByName: user?.role === 'supervisor' ? user.full_name : 'Sarah Lee (Supervisor)',
-      verifiedAt: isSubmitted ? formattedDate : undefined,
+      maintenanceCarriedBy: maintenanceCarriedBy || user?.full_name || 'Maintenance Staff',
+      signatureUrl: maintenanceSignatureUrl,
+      inspectedByName: inspectedBy || undefined,
+      inspectedBySignatureUrl: inspectedBySignatureUrl || null,
+      inspectedAt: inspectedBy ? formattedDate : undefined,
     });
+  };
+
+  // Save / Upload PDF to Dropbox
+  const handleSaveToDropbox = async () => {
+    setIsSavingDropbox(true);
+    setDropboxStatus(null);
+    try {
+      const formattedDate = formatDisplayDate(selectedDate);
+      const { blob, filename } = getInspectionPdfBlob({
+        roomNumber,
+        roomType,
+        inspectionDate: formattedDate,
+        quarter: selectedQuarter,
+        status: isSubmitted ? 'submitted' : 'in_progress',
+        sections,
+        itemsMap,
+        overallRemark,
+        maintenanceCarriedBy: maintenanceCarriedBy || user?.full_name || 'Maintenance Staff',
+        signatureUrl: maintenanceSignatureUrl,
+        inspectedByName: inspectedBy || undefined,
+        inspectedBySignatureUrl: inspectedBySignatureUrl || null,
+        inspectedAt: inspectedBy ? formattedDate : undefined,
+      });
+
+      const year = parseInt(selectedDate.split('-')[0], 10) || 2026;
+      const res = await api.uploadPdfToDropbox(blob, filename, {
+        room_number: roomNumber,
+        quarter: selectedQuarter,
+        year,
+      });
+
+      setDropboxStatus({
+        success: true,
+        message: `Successfully saved to Dropbox: ${res.path}`,
+        path: res.path,
+        share_url: res.share_url,
+      });
+    } catch (err: any) {
+      setDropboxStatus({
+        success: false,
+        message: err?.message || 'Failed to upload PDF report to Dropbox.',
+      });
+    } finally {
+      setIsSavingDropbox(false);
+    }
   };
 
   // Stats calculation
@@ -266,11 +482,7 @@ export const InspectionForm: React.FC = () => {
     }
   };
 
-  const inspectionDateDisplay = submittedAt || new Date().toLocaleDateString('en-GB', {
-    day: '2-digit',
-    month: 'short',
-    year: 'numeric',
-  });
+  const inspectionDateDisplay = formatDisplayDate(selectedDate);
 
   return (
     <div className="min-h-screen bg-slate-200/70 flex flex-col pb-32">
@@ -333,6 +545,86 @@ export const InspectionForm: React.FC = () => {
 
       {/* Main Form Sheet */}
       <main className="max-w-5xl w-full mx-auto px-3 sm:px-6 lg:px-8 py-6">
+        {/* Duplicate Inspection Warning Banner */}
+        {duplicateAlert && (
+          <div className="mb-6 p-4 rounded-2xl bg-rose-900/90 border-2 border-rose-500 text-white flex items-start gap-3 shadow-xl animate-in fade-in slide-in-from-top-3">
+            <AlertTriangle className="w-6 h-6 text-amber-300 flex-shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <div className="font-extrabold text-sm sm:text-base text-rose-100 uppercase tracking-wide">
+                Submission Blocked: Duplicate Inspection
+              </div>
+              <div className="text-xs sm:text-sm text-rose-200 mt-1 font-medium leading-relaxed">
+                {duplicateAlert}
+              </div>
+              <div className="mt-3 flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => navigate('/dashboard')}
+                  className="py-1.5 px-3 rounded-lg text-xs font-bold bg-white text-rose-950 hover:bg-rose-50 transition cursor-pointer"
+                >
+                  View Schedule in Dashboard
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDuplicateAlert(null)}
+                  className="py-1.5 px-3 rounded-lg text-xs font-semibold bg-rose-950/60 hover:bg-rose-950 text-rose-200 border border-rose-700 transition cursor-pointer"
+                >
+                  Dismiss Warning
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Dropbox Upload Status Banner */}
+        {dropboxStatus && (
+          <div className={`mb-6 p-4 rounded-2xl border flex items-center justify-between gap-4 shadow-xl animate-in fade-in slide-in-from-top-2 ${
+            dropboxStatus.success
+              ? 'bg-blue-950/90 border-blue-500 text-blue-100'
+              : 'bg-rose-950/90 border-rose-600 text-rose-100'
+          }`}>
+            <div className="flex items-center gap-3">
+              {dropboxStatus.success ? (
+                <div className="w-9 h-9 rounded-xl bg-blue-600 flex items-center justify-center text-white shadow">
+                  <FolderCheck className="w-5 h-5" />
+                </div>
+              ) : (
+                <div className="w-9 h-9 rounded-xl bg-rose-700 flex items-center justify-center text-white shadow">
+                  <AlertTriangle className="w-5 h-5" />
+                </div>
+              )}
+              <div>
+                <div className="font-bold text-sm text-white">
+                  {dropboxStatus.success ? 'Saved to Dropbox' : 'Dropbox Upload Notice'}
+                </div>
+                <div className="text-xs opacity-90 mt-0.5">
+                  {dropboxStatus.message}
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              {dropboxStatus.share_url && (
+                <a
+                  href={dropboxStatus.share_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="py-1.5 px-3 rounded-lg text-xs font-bold bg-blue-500 hover:bg-blue-400 text-white flex items-center gap-1 shadow transition"
+                >
+                  <span>Open in Dropbox</span>
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+              )}
+              <button
+                type="button"
+                onClick={() => setDropboxStatus(null)}
+                className="py-1.5 px-2.5 rounded-lg text-xs font-semibold bg-white/10 hover:bg-white/20 text-white transition cursor-pointer"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Status Callout Banner */}
         {isSubmitted && (
           <div className="mb-6 p-4 rounded-2xl bg-emerald-950/80 border border-emerald-700 text-emerald-100 flex flex-col sm:flex-row items-center justify-between gap-4 shadow-xl print:hidden">
@@ -345,18 +637,33 @@ export const InspectionForm: React.FC = () => {
                   Inspection Officially Submitted!
                 </div>
                 <div className="text-xs text-emerald-200">
-                  Room {roomNumber} ({roomType}) checklist is finalized. Download your official PDF report below.
+                  Room {roomNumber} ({roomType}) checklist is finalized for {selectedQuarter}. Download report or save to Dropbox below.
                 </div>
               </div>
             </div>
-            <div className="flex items-center gap-2.5">
+            <div className="flex flex-wrap items-center gap-2.5">
               <button
                 type="button"
                 onClick={handleDownloadPdf}
-                className="py-2 px-4 rounded-xl text-xs font-bold bg-amber-400 hover:bg-amber-300 text-slate-950 flex items-center gap-1.5 shadow transition cursor-pointer"
+                className="py-2 px-3.5 rounded-xl text-xs font-bold bg-amber-400 hover:bg-amber-300 text-slate-950 flex items-center gap-1.5 shadow transition cursor-pointer"
+                title="Download local PDF"
               >
                 <FileDown className="w-4 h-4" />
                 <span>Download PDF</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleSaveToDropbox}
+                disabled={isSavingDropbox}
+                className="py-2 px-3.5 rounded-xl text-xs font-bold bg-[#0061FE] hover:bg-[#0052d9] text-white flex items-center gap-1.5 shadow transition cursor-pointer disabled:opacity-50"
+                title="Save PDF directly to Dropbox Cloud"
+              >
+                {isSavingDropbox ? (
+                  <RefreshCw className="w-4 h-4 animate-spin text-white" />
+                ) : (
+                  <UploadCloud className="w-4 h-4 text-white" />
+                )}
+                <span>{isSavingDropbox ? 'Saving...' : 'Save to Dropbox'}</span>
               </button>
               <button
                 type="button"
@@ -375,10 +682,10 @@ export const InspectionForm: React.FC = () => {
           {/* Document Header */}
           <div className="border-b-2 border-slate-900 pb-5 mb-6 text-center">
             <h1 className="text-2xl sm:text-3xl font-extrabold font-brand tracking-wider text-slate-900 uppercase">
-              MAXWELL INSPECTION LIST
+              ROOM PREVENTIVE MAINTENANCE
             </h1>
             <div className="text-xs text-slate-500 tracking-widest uppercase font-semibold mt-1">
-              The Maxwell &bull; Preventive Maintenance Checklist Form
+              The Maxwell &bull; Room Preventive Maintenance Checklist Form
             </div>
           </div>
 
@@ -489,46 +796,48 @@ export const InspectionForm: React.FC = () => {
                                 {item.description}
                               </td>
 
-                              {/* Toggle Buttons (√ / X / N/A) */}
+                              {/* Pass / Defect Button Toggle */}
                               <td className="py-2 px-3 border-r border-slate-200 align-top text-center">
-                                <div className="inline-flex items-center gap-1">
-                                  {/* PASS BUTTON */}
+                                <div className="inline-flex items-center rounded-lg border border-slate-300 p-0.5 bg-slate-100">
+                                  {/* PASS */}
                                   <button
                                     type="button"
                                     disabled={isSubmitted}
-                                    onClick={() => handleItemResult(item.id, 'pass', rem)}
-                                    title="Mark as Pass (√)"
-                                    className={`w-7 h-7 rounded text-xs font-bold flex items-center justify-center transition cursor-pointer disabled:cursor-default ${res === 'pass'
-                                        ? 'bg-emerald-600 text-white shadow-sm ring-2 ring-emerald-600/30'
-                                        : 'bg-slate-100 hover:bg-emerald-50 text-slate-500 hover:text-emerald-700'
+                                    onClick={() => handleItemResult(item.id, 'pass')}
+                                    title="Pass (No Defects)"
+                                    className={`px-2.5 py-1 text-xs font-bold rounded-md flex items-center gap-0.5 transition cursor-pointer ${res === 'pass'
+                                        ? 'bg-emerald-600 text-white shadow-sm'
+                                        : 'text-slate-600 hover:text-emerald-700 hover:bg-white'
                                       }`}
                                   >
                                     <Check className="w-3.5 h-3.5" />
+                                    <span>Pass</span>
                                   </button>
 
-                                  {/* FAIL BUTTON */}
+                                  {/* DEFECT / FAIL */}
                                   <button
                                     type="button"
                                     disabled={isSubmitted}
-                                    onClick={() => handleItemResult(item.id, 'fail', rem)}
-                                    title="Mark as Fail (X)"
-                                    className={`w-7 h-7 rounded text-xs font-bold flex items-center justify-center transition cursor-pointer disabled:cursor-default ${res === 'fail'
-                                        ? 'bg-rose-600 text-white shadow-sm ring-2 ring-rose-600/30'
-                                        : 'bg-slate-100 hover:bg-rose-50 text-slate-500 hover:text-rose-700'
+                                    onClick={() => handleItemResult(item.id, 'fail')}
+                                    title="Defect / Fail"
+                                    className={`px-2 py-1 text-xs font-bold rounded-md flex items-center gap-0.5 transition cursor-pointer ${res === 'fail'
+                                        ? 'bg-rose-600 text-white shadow-sm'
+                                        : 'text-slate-600 hover:text-rose-700 hover:bg-white'
                                       }`}
                                   >
                                     <X className="w-3.5 h-3.5" />
+                                    <span>Defect</span>
                                   </button>
 
-                                  {/* N/A BUTTON */}
+                                  {/* N/A */}
                                   <button
                                     type="button"
                                     disabled={isSubmitted}
-                                    onClick={() => handleItemResult(item.id, 'na', rem)}
-                                    title="Mark as N/A"
-                                    className={`px-1.5 h-7 rounded text-[10px] font-bold flex items-center justify-center transition cursor-pointer disabled:cursor-default ${res === 'na'
-                                        ? 'bg-slate-700 text-white'
-                                        : 'bg-slate-100 hover:bg-slate-200 text-slate-400 hover:text-slate-700'
+                                    onClick={() => handleItemResult(item.id, 'na')}
+                                    title="Not Applicable"
+                                    className={`px-1.5 py-1 text-[11px] font-semibold rounded-md transition cursor-pointer ${res === 'na'
+                                        ? 'bg-slate-700 text-white shadow-sm'
+                                        : 'text-slate-400 hover:text-slate-700 hover:bg-white'
                                       }`}
                                   >
                                     NA
@@ -536,44 +845,40 @@ export const InspectionForm: React.FC = () => {
                                 </div>
                               </td>
 
-                              {/* Remarks column */}
-                              <td className="py-2 px-3 align-top">
-                                <div className="space-y-1">
-                                  <input
-                                    type="text"
-                                    disabled={isSubmitted}
-                                    value={rem}
-                                    onChange={(e) =>
-                                      handleItemResult(item.id, res || 'fail', e.target.value)
-                                    }
-                                    placeholder={
-                                      isFail
-                                        ? 'Describe defect / repair required...'
-                                        : 'Optional remarks...'
-                                    }
-                                    className={`w-full text-xs px-2.5 py-1.5 rounded border focus:outline-none focus:ring-1 ${isFail
-                                        ? 'border-rose-300 focus:ring-rose-400 bg-white'
-                                        : 'border-slate-200 focus:ring-slate-400 bg-white'
-                                      } disabled:bg-slate-50`}
-                                  />
-                                  {isFail && !isSubmitted && (
-                                    <div className="flex items-center gap-1 flex-wrap pt-0.5 print:hidden">
-                                      {QUICK_DEFECT_TAGS.slice(0, 3).map((tag) => (
-                                        <button
-                                          key={tag}
-                                          type="button"
-                                          onClick={() => {
-                                            const updated = rem ? `${rem}, ${tag}` : tag;
-                                            handleItemResult(item.id, 'fail', updated);
-                                          }}
-                                          className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 hover:bg-slate-200 text-slate-600 font-medium cursor-pointer"
-                                        >
-                                          + {tag}
-                                        </button>
-                                      ))}
-                                    </div>
-                                  )}
-                                </div>
+                              {/* Remarks & Quick Tags */}
+                              <td className="py-2 px-4 align-top">
+                                <input
+                                  type="text"
+                                  disabled={isSubmitted}
+                                  value={rem}
+                                  onChange={(e) => handleItemResult(item.id, res || 'fail', e.target.value)}
+                                  placeholder={isFail ? 'Describe defect details...' : 'Optional remarks...'}
+                                  className={`w-full text-xs px-2.5 py-1.5 rounded border focus:outline-none focus:ring-1 ${isFail
+                                      ? 'border-rose-300 bg-rose-50/40 text-rose-900 placeholder:text-rose-400 focus:ring-rose-500'
+                                      : 'border-slate-300 bg-white text-slate-800 placeholder:text-slate-400 focus:ring-slate-800'
+                                    }`}
+                                />
+
+                                {/* Quick Defect Suggestion Pills */}
+                                {isFail && !rem && !isSubmitted && (
+                                  <div className="flex flex-wrap gap-1 mt-1.5">
+                                    {((QUICK_DEFECT_TAGS as unknown as Record<string, string[]>)[item.description] || [
+                                      'Needs cleaning',
+                                      'Loose fixture',
+                                      'Damaged',
+                                      'Chemical wash required',
+                                    ]).map((tag: string, tIdx: number) => (
+                                      <button
+                                        key={tIdx}
+                                        type="button"
+                                        onClick={() => handleItemResult(item.id, 'fail', tag)}
+                                        className="text-[10px] bg-rose-100 hover:bg-rose-200 text-rose-800 px-1.5 py-0.5 rounded font-medium transition cursor-pointer"
+                                      >
+                                        + {tag}
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
                               </td>
                             </tr>
                           );
@@ -604,79 +909,175 @@ export const InspectionForm: React.FC = () => {
             />
           </div>
 
-          {/* Form Footer Matching Template: Date / Inspected By / Verified By */}
+          {/* Form Footer: 1) Date & Quarter (Mandatory), 2) Maintenance Carried By (Mandatory), 3) Inspected By (Optional) */}
           <div id="form-footer" className="mt-8 pt-6 border-t-2 border-slate-900">
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              {/* Date Box */}
-              <div className="p-4 rounded-xl border border-slate-300 bg-slate-50 flex flex-col justify-between">
+              {/* CARD 1: Date & Quarter Selection (Mandatory) */}
+              <div className="p-4 rounded-xl border border-slate-300 bg-slate-50 flex flex-col justify-between space-y-4">
                 <div>
-                  <div className="text-xs font-extrabold uppercase tracking-wider text-slate-600 mb-1">
-                    Date:
+                  {/* Date Picker */}
+                  <div className="mb-4">
+                    <label htmlFor="manual-date-input" className="text-xs font-extrabold uppercase tracking-wider text-slate-700 mb-1.5 flex items-center justify-between">
+                      <span>Date: <span className="text-rose-600">*</span></span>
+                      <span className="text-[10px] font-semibold text-rose-600 uppercase bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">Mandatory</span>
+                    </label>
+                    <div className="relative">
+                      <input
+                        id="manual-date-input"
+                        type="date"
+                        disabled={isSubmitted}
+                        value={selectedDate}
+                        onChange={(e) => {
+                          setSelectedDate(e.target.value);
+                          triggerAutosave();
+                        }}
+                        className="w-full text-sm font-bold text-slate-900 bg-white border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-900 disabled:bg-slate-100 cursor-pointer shadow-sm"
+                      />
+                    </div>
+                    <div className="text-xs font-medium text-slate-600 mt-1.5">
+                      Selected: <span className="font-bold text-slate-900">{inspectionDateDisplay}</span>
+                    </div>
                   </div>
-                  <div className="text-base font-bold text-slate-900">{inspectionDateDisplay}</div>
+
+                  {/* Quarter Selection (Bottom of Date) */}
+                  <div className="pt-3 border-t border-slate-200">
+                    <label htmlFor="quarter-select-input" className="text-xs font-extrabold uppercase tracking-wider text-slate-700 mb-1.5 flex items-center justify-between">
+                      <span>Schedule Quarter: <span className="text-rose-600">*</span></span>
+                      <span className="text-[10px] font-semibold text-rose-600 uppercase bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">Mandatory</span>
+                    </label>
+                    <select
+                      id="quarter-select-input"
+                      disabled={isSubmitted}
+                      value={selectedQuarter}
+                      onChange={(e) => {
+                        setSelectedQuarter(e.target.value);
+                        triggerAutosave();
+                      }}
+                      className="w-full text-xs font-bold text-slate-900 bg-white border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-900 disabled:bg-slate-100 cursor-pointer shadow-sm"
+                    >
+                      <option value="2nd Quarter (May - August)">2nd Quarter (May - August)</option>
+                      <option value="1st Quarter (Jan - April)">1st Quarter (Jan - April)</option>
+                      <option value="3rd Quarter (Sep - Dec)">3rd Quarter (Sep - Dec)</option>
+                      <option value="4th Quarter (Oct - Dec)">4th Quarter (Oct - Dec)</option>
+                    </select>
+                  </div>
                 </div>
-                <div className="text-[11px] text-slate-400 mt-4">
-                  Official inspection timestamp
+
+                <div className="text-[11px] text-slate-400">
+                  Manual inspection date & quarter schedule
                 </div>
               </div>
 
-              {/* Inspected By & Signature Picture */}
-              <div className="p-4 rounded-xl border border-slate-300 bg-white flex flex-col justify-between">
+              {/* CARD 2: Maintenance carried By (Mandatory: Name & Signature Image) */}
+              <div className="p-4 rounded-xl border-2 border-slate-300 bg-white flex flex-col justify-between space-y-3">
                 <div>
-                  <div className="text-xs font-extrabold uppercase tracking-wider text-slate-600 mb-1">
-                    Inspected By:
-                  </div>
-                  <div className="text-sm font-bold text-slate-800">
-                    {user?.full_name || 'Inspector John Tan'}
-                  </div>
+                  <label htmlFor="maintenance-carried-by-input" className="text-xs font-extrabold uppercase tracking-wider text-slate-700 mb-1.5 flex items-center justify-between">
+                    <span>Maintenance carried By: <span className="text-rose-600">*</span></span>
+                    <span className="text-[10px] font-semibold text-rose-600 uppercase bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">Mandatory</span>
+                  </label>
+                  <input
+                    id="maintenance-carried-by-input"
+                    type="text"
+                    disabled={isSubmitted}
+                    value={maintenanceCarriedBy}
+                    onChange={(e) => {
+                      setMaintenanceCarriedBy(e.target.value);
+                      triggerAutosave();
+                    }}
+                    placeholder="Enter technician name..."
+                    className="w-full text-sm font-bold text-slate-900 bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-900 disabled:bg-slate-100 mb-2.5 shadow-sm"
+                  />
 
-                  {/* Display selected/drawn signature */}
-                  {selectedSignatureUrl ? (
-                    <div className="p-3 border-2 border-slate-300 rounded-xl bg-slate-50/80 my-2 flex flex-col items-center justify-center min-h-[70px]">
+                  {/* Display selected signature */}
+                  {maintenanceSignatureUrl ? (
+                    <div className="p-2.5 border-2 border-emerald-400 rounded-xl bg-emerald-50/30 my-2 flex flex-col items-center justify-center min-h-[60px]">
                       <img
-                        src={selectedSignatureUrl}
-                        alt="Inspector Signature"
-                        className="max-h-16 max-w-full object-contain"
+                        src={maintenanceSignatureUrl}
+                        alt="Maintenance Signature"
+                        className="max-h-12 max-w-full object-contain"
                       />
                     </div>
                   ) : (
-                    <div className="h-16 border-2 border-dashed border-slate-300 rounded-xl bg-slate-50 flex items-center justify-center text-xs text-slate-400 my-2">
-                      (Select or draw signature picture below)
+                    <div className="h-14 border-2 border-dashed border-rose-300 rounded-xl bg-rose-50/40 flex items-center justify-center text-xs font-medium text-rose-600 my-2">
+                      ⚠️ Signature Image Required
                     </div>
                   )}
                 </div>
 
                 {!isSubmitted ? (
-                  <div className="mt-2 print:hidden">
+                  <div className="mt-1 print:hidden">
                     <SignatureSelector
-                      selectedSignatureUrl={selectedSignatureUrl}
-                      onSelectSignature={handleSelectSignature}
-                      inspectorName={user?.full_name}
+                      label="Maintenance Signature Picture *"
+                      storageKey="maxwell_maintenance_signatures"
+                      selectedSignatureUrl={maintenanceSignatureUrl}
+                      onSelectSignature={(url) => {
+                        setMaintenanceSignatureUrl(url);
+                        saveInspectionState({ maintenanceSignatureUrl: url });
+                      }}
+                      autoSelectFirst={true}
                     />
                   </div>
                 ) : (
-                  <div className="text-center text-[11px] text-emerald-700 font-semibold mt-2">
-                    ✓ Attached Digital Signature
+                  <div className="text-center text-[11px] text-emerald-700 font-semibold mt-1">
+                    ✓ Attached Maintenance Signature
                   </div>
                 )}
               </div>
 
-              {/* Verified By */}
-              <div className="p-4 rounded-xl border border-slate-300 bg-slate-50 flex flex-col justify-between">
+              {/* CARD 3: Inspected By (NOT Mandatory: Name & Signature Optional) */}
+              <div className="p-4 rounded-xl border border-slate-300 bg-slate-50 flex flex-col justify-between space-y-3">
                 <div>
-                  <div className="text-xs font-extrabold uppercase tracking-wider text-slate-600 mb-1">
-                    Verified By:
-                  </div>
-                  <div className="text-sm font-bold text-slate-900">
-                    {user?.role === 'supervisor' ? user.full_name : 'Sarah Lee (Supervisor)'}
-                  </div>
-                  <div className="text-xs text-emerald-600 font-medium mt-1">
-                    Verified on {inspectionDateDisplay}
-                  </div>
+                  <label htmlFor="inspected-by-input" className="text-xs font-extrabold uppercase tracking-wider text-slate-700 mb-1.5 flex items-center justify-between">
+                    <span>Inspected By:</span>
+                    <span className="text-[10px] font-semibold text-slate-500 uppercase bg-slate-200 px-1.5 py-0.5 rounded">Optional</span>
+                  </label>
+                  <input
+                    id="inspected-by-input"
+                    type="text"
+                    disabled={isSubmitted}
+                    value={inspectedBy}
+                    onChange={(e) => {
+                      setInspectedBy(e.target.value);
+                      triggerAutosave();
+                    }}
+                    placeholder="Inspector / Supervisor name (Optional)..."
+                    className="w-full text-sm font-bold text-slate-900 bg-white border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-900 disabled:bg-slate-100 mb-2.5 shadow-sm"
+                  />
+
+                  {/* Display inspected by signature if uploaded */}
+                  {inspectedBySignatureUrl ? (
+                    <div className="p-2.5 border-2 border-slate-300 rounded-xl bg-white my-2 flex flex-col items-center justify-center min-h-[60px]">
+                      <img
+                        src={inspectedBySignatureUrl}
+                        alt="Inspected By Signature"
+                        className="max-h-12 max-w-full object-contain"
+                      />
+                    </div>
+                  ) : (
+                    <div className="h-14 border-2 border-dashed border-slate-200 rounded-xl bg-white/60 flex items-center justify-center text-xs text-slate-400 my-2">
+                      (Optional sign-off signature)
+                    </div>
+                  )}
                 </div>
-                <div className="text-[11px] text-slate-400 mt-4">
-                  Engineering supervisor sign-off
-                </div>
+
+                {!isSubmitted ? (
+                  <div className="mt-1 print:hidden">
+                    <SignatureSelector
+                      label="Inspected By Signature Picture (Optional)"
+                      storageKey="maxwell_inspected_signatures"
+                      selectedSignatureUrl={inspectedBySignatureUrl}
+                      onSelectSignature={(url) => {
+                        setInspectedBySignatureUrl(url);
+                        saveInspectionState({ inspectedBySignatureUrl: url });
+                      }}
+                      autoSelectFirst={false}
+                    />
+                  </div>
+                ) : (
+                  <div className="text-center text-[11px] text-slate-600 font-medium mt-1">
+                    {inspectedBy ? `✓ Inspected by ${inspectedBy}` : 'Official Inspection Sign-off'}
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -692,7 +1093,10 @@ export const InspectionForm: React.FC = () => {
                   <CheckCircle2 className="w-4 h-4" /> This inspection is officially submitted.
                 </span>
               ) : (
-                <span>Ensure all sections are checked and signature is selected before submitting.</span>
+                <span className="flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-full bg-amber-500"></span>
+                  <span>Fill all items and attach required signature before submitting.</span>
+                </span>
               )}
             </div>
 
@@ -702,10 +1106,23 @@ export const InspectionForm: React.FC = () => {
                   <button
                     type="button"
                     onClick={handleDownloadPdf}
-                    className="flex-1 sm:flex-initial py-3 px-6 rounded-xl text-sm font-bold bg-slate-900 hover:bg-slate-800 text-white flex items-center justify-center gap-2 shadow-lg transition cursor-pointer"
+                    className="flex-1 sm:flex-initial py-3 px-5 rounded-xl text-sm font-bold bg-slate-900 hover:bg-slate-800 text-white flex items-center justify-center gap-2 shadow-lg transition cursor-pointer"
                   >
                     <FileDown className="w-4 h-4 text-amber-400" />
-                    <span>Download PDF Report</span>
+                    <span>Download PDF</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSaveToDropbox}
+                    disabled={isSavingDropbox}
+                    className="flex-1 sm:flex-initial py-3 px-5 rounded-xl text-sm font-bold bg-[#0061FE] hover:bg-[#0052d9] text-white flex items-center justify-center gap-2 shadow-lg transition cursor-pointer disabled:opacity-50"
+                  >
+                    {isSavingDropbox ? (
+                      <RefreshCw className="w-4 h-4 animate-spin text-white" />
+                    ) : (
+                      <UploadCloud className="w-4 h-4 text-white" />
+                    )}
+                    <span>{isSavingDropbox ? 'Saving to Dropbox...' : 'Save to Dropbox'}</span>
                   </button>
                   <button
                     type="button"
@@ -720,10 +1137,20 @@ export const InspectionForm: React.FC = () => {
                 <button
                   type="button"
                   onClick={handleSubmit}
-                  className="w-full sm:w-auto py-3 px-8 rounded-xl text-sm font-bold bg-slate-900 hover:bg-slate-800 text-white flex items-center justify-center gap-2 shadow-lg shadow-slate-900/20 transition cursor-pointer"
+                  disabled={isCheckingDuplicate}
+                  className="w-full sm:w-auto py-3.5 px-8 rounded-xl text-sm font-extrabold bg-slate-900 hover:bg-slate-800 text-white flex items-center justify-center gap-2 shadow-lg shadow-slate-900/20 transition cursor-pointer active:scale-95 disabled:opacity-60"
                 >
-                  <Send className="w-4 h-4 text-amber-400" />
-                  <span>Submit Official Inspection</span>
+                  {isCheckingDuplicate ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 text-amber-400 animate-spin" />
+                      <span>Checking Schedule...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Send className="w-4 h-4 text-amber-400" />
+                      <span>Submit Official Inspection</span>
+                    </>
+                  )}
                 </button>
               )}
             </div>

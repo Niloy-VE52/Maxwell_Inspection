@@ -30,14 +30,14 @@ export const Login: React.FC = () => {
     };
 
     login(`token_${Date.now()}`, userToLogin);
-    navigate('/form');
+    navigate('/dashboard');
   };
 
   const handleQuickLogin = (demoEmail: string) => {
     const matched = DEFAULT_USERS.find((u) => u.email === demoEmail);
     if (matched) {
       login(`token_${Date.now()}`, matched);
-      navigate('/form');
+      navigate('/dashboard');
     }
   };
 
@@ -57,7 +57,7 @@ export const Login: React.FC = () => {
           THE MAXWELL
         </h2>
         <p className="mt-1 text-center text-xs font-semibold tracking-widest uppercase text-amber-400/90">
-          Preventive Maintenance Inspection System
+          Room Preventive Maintenance Inspection System
         </p>
       </div>
 
